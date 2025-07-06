@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import json
+import urllib.parse
 from typing import Optional
 
 import httpx
@@ -14,6 +15,8 @@ from app.models import (
     APRSAssignee,
     APRSIncident,
     LogEvent,
+    ResolutionPlanRequest,
+    ResolutionPlanResponse,
     TriageResponse,
 )
 
@@ -23,14 +26,19 @@ load_dotenv()
 # Constants
 APRS_BASE_URL = "https://96ef-202-54-141-35.ngrok-free.app/api"
 TRIAGE_AUTHOR = "triage_agent"
+DIAGNOSIS_AGENT_AUTHOR = "diagnosis-agent"
 DEFAULT_ASSIGNEE = "John Doe"
-RCA_DELAY_SECONDS = 10
+RCA_DELAY_SECONDS = 5
 
 # Create FastAPI instance
 app = FastAPI(
     title="Triage Agent API",
     description="An intelligent triage agent for incident management and root cause analysis",
     version="1.0.0",
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -116,6 +124,23 @@ class APRSClient:
         payload = {"analysis": analysis}
         logger.info(f"Creating root cause analysis for incident {incident_id}")
         return await self._make_request("POST", endpoint, payload)
+
+    async def get_kb_data(self, query: str) -> str:
+        """Get KB data from the KB API."""
+        endpoint = f"kb/search?query={urllib.parse.quote(query)}"
+        kb_data = await self._make_request("GET", endpoint)
+        references = [
+            "<REFERENCE>\n" + item["text"] + "\n</REFERENCE>" for item in kb_data
+        ]
+        return "\n".join(references)
+
+    async def save_resolution_plan(
+        self, incident_id: str, resolution_plan: dict
+    ) -> dict:
+        """Save the resolution plan for an incident."""
+        endpoint = f"incidents/{incident_id}/resolution-plan"
+        logger.info(f"Saving resolution plan for incident {incident_id}")
+        return await self._make_request("POST", endpoint, resolution_plan)
 
 
 async def create_incident_timeline_entries(
@@ -218,7 +243,8 @@ async def analyze_logs_with_ai(log_events: list[LogEvent]) -> TriageResponse:
                     "content": (
                         "You are a triage agent and an expert at root cause analysis. "
                         "You will be given a list of logs, and you need to provide a short summary "
-                        "of the root cause of the issue."
+                        "of the root cause of the issue. and the title of the incident."
+                        "Generate the short summary in markdown format."
                     ),
                 },
                 {
@@ -236,6 +262,125 @@ async def analyze_logs_with_ai(log_events: list[LogEvent]) -> TriageResponse:
     except Exception as e:
         logger.error(f"Failed to analyze logs with AI: {e}")
         raise HTTPException(status_code=500, detail="Failed to analyze logs with AI")
+
+
+async def find_resolution_plan(
+    aprs_client: APRSClient, resolution_request: ResolutionPlanRequest
+) -> ResolutionPlanResponse:
+    """Find a resolution plan for an incident."""
+    try:
+        # Get KB data
+        kb_data = await aprs_client.get_kb_data(resolution_request.rca_title)
+
+        response = await acompletion(
+            model="anthropic.claude-3-5-haiku-20241022-v1:0",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a resolution plan agent and an expert at finding resolution plans for incidents."
+                        "You will be given a summary of the root cause of the incident and the logs of the incident."
+                        "You will also be given a list of references from the knowledge base."
+                        "You will need to find a resolution plan for the incident."
+                        "You will need to return a resolution plan in markdown format, step by step"
+                        "You will also need to return a aws cli command to execute the resolution plan."
+                        "For simple problem, a single step is enough. For complex problem, you can have multiple steps."
+                        "The aws cli command should be in the format of 'aws <command> <subcommand> <options>'"
+                        "The applications are all running on aws App Runner. so Generate the aws cli command for the aws app runner."
+                        "Also generate a confidence score for the resolution plan between 0 and 100."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"The root cause summary is: {resolution_request.rca_summary}\n\nThe logs are: {resolution_request.logs}\n\nThe references are: {kb_data}",
+                },
+            ],
+            response_format=ResolutionPlanResponse,
+        )
+
+        return ResolutionPlanResponse.model_validate(
+            json.loads(response.choices[0].message.content)
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to find resolution plan: {e}")
+        raise HTTPException(status_code=500, detail="Failed to find resolution plan")
+
+
+async def complete_rca_and_resolution_plan(
+    aprs_client: APRSClient,
+    incident_id: str,
+    triage_title: str,
+    triage_summary: str,
+    log_events: list[LogEvent],
+) -> None:
+    """Complete the RCA process and then generate a resolution plan."""
+    try:
+        # First, complete the RCA process
+        await complete_rca_process(
+            aprs_client, incident_id, triage_title, triage_summary
+        )
+
+        # Create timeline entry for starting resolution plan generation
+        logger.info(f"Starting resolution plan generation for incident {incident_id}")
+        resolution_start_payload = {
+            "status": "in_progress",
+            "logSnippet": "Using AI to generate remedy for the issue",
+            "timestamp": str(datetime.datetime.now()),
+            "author": DIAGNOSIS_AGENT_AUTHOR,
+        }
+
+        await aprs_client.create_timeline_entry(
+            incident_id, "resolution-plan", resolution_start_payload
+        )
+
+        # Generate the resolution plan
+        resolution_request = ResolutionPlanRequest(
+            incident_id=incident_id,
+            rca_title=triage_title,
+            rca_summary=triage_summary,
+            logs=log_events,
+        )
+
+        resolution_plan = await find_resolution_plan(aprs_client, resolution_request)
+
+        # Create timeline entry for assessing confidence score
+        logger.info(
+            f"Assessing confidence score for resolution plan for incident {incident_id}"
+        )
+        confidence_assessment_payload = {
+            "status": "in_progress",
+            "logSnippet": "Assessing confidence score for resolution plan",
+            "timestamp": str(datetime.datetime.now()),
+            "author": DIAGNOSIS_AGENT_AUTHOR,
+        }
+
+        await aprs_client.create_timeline_entry(
+            incident_id, "resolution-plan", confidence_assessment_payload
+        )
+
+        # Convert resolution plan to API format
+        api_resolution_plan = {
+            "confidenceScore": resolution_plan.confidence_score,
+            "steps": [
+                {
+                    "stepNumber": step.step_number,
+                    "command": step.step_aws_cli_command,
+                    "description": step.step_procedure,
+                }
+                for step in resolution_plan.resolution_plan
+            ],
+        }
+
+        # Save the resolution plan
+        await aprs_client.save_resolution_plan(incident_id, api_resolution_plan)
+
+        logger.info(
+            f"Resolution plan saved for incident {incident_id} with {resolution_plan.confidence_score}% confidence"
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to complete RCA and resolution plan process: {e}")
 
 
 @app.post("/api/v1/triage", response_model=TriageResponse)
@@ -277,20 +422,29 @@ async def triage_logs(log_events: list[LogEvent]):
         aprs_client, incident_id, log_events, triage_response.triage_title
     )
 
-    # Complete RCA process asynchronously
+    # Complete RCA and resolution plan asynchronously
     asyncio.create_task(
-        complete_rca_process(
+        complete_rca_and_resolution_plan(
             aprs_client,
             incident_id,
             triage_response.triage_title,
             triage_response.triage_summary,
+            log_events,
         )
     )
 
     logger.info(
-        f"Successfully triaged incident {incident_id}: {triage_response.triage_title}"
+        f"Successfully triaged and completed RCA and resolution plan for incident {incident_id}: {triage_response.triage_title}"
     )
+
     return triage_response
+
+
+@app.post("/api/v1/resolution-plan", response_model=ResolutionPlanResponse)
+async def resolution_plan_generation(resolution_request: ResolutionPlanRequest):
+    """Find a resolution plan for an incident."""
+    aprs_client = APRSClient()
+    return await find_resolution_plan(aprs_client, resolution_request)
 
 
 @app.get("/health")

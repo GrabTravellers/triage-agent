@@ -10,19 +10,6 @@ class LogEvent(BaseModel):
     service: str
     trace_id: str
 
-
-class LogEventList(BaseModel):
-    events: List[LogEvent]
-
-    def __str__(self):
-        return "\n".join(
-            [
-                f"{event.service}: {event.trace_id} - {event.timestamp} - {event.level} - {event.message}"
-                for event in self.events
-            ]
-        )
-
-
 class TriageResponse(BaseModel):
     triage_summary: str
     triage_title: str
@@ -41,3 +28,19 @@ class APRSIncident(BaseModel):
     createdBy: str
     status: str
     createdAt: str
+
+class ResolutionPlanRequest(BaseModel):
+    incident_id: str
+    rca_title: str
+    rca_summary: str
+    logs: List[LogEvent]
+
+
+class ResolutionPlanStep(BaseModel):
+    step_number: int
+    step_procedure: str
+    step_aws_cli_command: str
+
+class ResolutionPlanResponse(BaseModel):
+    resolution_plan: List[ResolutionPlanStep]
+    confidence_score: int

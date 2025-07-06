@@ -12,9 +12,12 @@ dependencies = [
     "uvicorn>=0.24.0",
     "httpx>=0.25.0",
     "loguru>=0.7.3",
+    "gunicorn>=23.0.0",
 ]
 
 [dependency-groups]
 dev = [
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.7",
     "killport>=1.2.0",
 ]
